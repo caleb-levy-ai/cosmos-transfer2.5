@@ -155,6 +155,15 @@ def build_outputs(args: argparse.Namespace, save_folder: str) -> None:
             idx_in_chunk = int(jpg.split(".")[1])
             contributions[global_index].append((idx_in_chunk, os.path.join(camera_gbuffer, jpg)))
 
+        # The last chunk is padded up to num_frames, so it can emit "frames" past the
+        # real input count (duplicates of the final frame). Drop those phantom frames
+        # so staged albedo matches the real RGB frames exactly.
+        input_camera_dir = os.path.join(args.input_root, camera)
+        n_input = len([f for f in os.listdir(input_camera_dir) if f.endswith(".png")]) \
+            if os.path.isdir(input_camera_dir) else 0
+        if n_input:
+            contributions = {g: c for g, c in contributions.items() if g < n_input}
+
         n_blended = 0
         for global_index, contribs in sorted(contributions.items()):
             if len(contribs) == 1:
