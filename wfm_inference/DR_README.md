@@ -15,8 +15,21 @@ in the applied3 repo.
 Lilypad generic workload → Ray cluster:
 - **Head node** (CPU) runs `wfm_inference.dr_lilypad_entrypoint.run`.
 - **GPU worker** (1× A100) runs `_run_dr_on_gpu`: downloads weights from OCI once,
-  then runs `wfm_inference.dr_smoke_inference` (no torchrun — DR inverse is
-  single-process), uploads outputs + a `succeed.txt` marker.
+  then runs the requested mode (no torchrun — DR inverse is single-process),
+  uploads outputs + a `succeed.txt` marker.
+
+Two modes (`config["mode"]`, default `smoke`):
+- **smoke** (phase 1): `wfm_inference.dr_smoke_inference` on a synthetic zeros video.
+- **segment** (phase 2): downloads real exported frames from OCI, then
+  `wfm_inference.run_dr_on_segment`, a thin wrapper that drives the **upstream**
+  `cosmos_predict1.diffusion.inference.inference_inverse_renderer` in `--group_mode
+  folder` (one camera subfolder = one clip → all cameras in a single pipeline load).
+  We do not re-implement frame loading / resize / chunking / gamma — upstream does it.
+  Long clips are handled by upstream `--overlap_n_frames` / `--chunk_mode` (plain
+  overlap-chunking, **not** BrickDiffusion). Albedo is saved raw (display-ready);
+  inverse-gamma for linear `A*S+R` compositing is a phase-3 reconstruction concern.
+  Outputs are curated into `<camera>/albedo/NNNN.basecolor.jpg` and side-by-side
+  `<camera>/mosaic/NNNN.png` (`[input | albedo]`).
 
 DR needs only **1 GPU (~27 GB)**. There is no HF-cache step: zero T5 embeddings
 are passed at inference, so no text encoder is required; only the two weight dirs
@@ -92,3 +105,36 @@ Use standard `AWS_*` vars (pass-through from the submitting shell; confirmed in
 the Neural Sim Lilypad Cookbook). Verify success: `succeed.txt` and
 `albedo_frame0.npy` appear under `s3://sensor-sim-wfm/inferences/dr_smoke_test/`,
 with a peak-VRAM line (~27 GB) in `lilypad workload logs <id>`.
+
+## Segment mode (phase 2 — real frames)
+
+The phase-2 image tag is `cosmos_dr_inverse_v0.0.2` (adds `run_dr_on_segment.py` +
+segment-mode entrypoint; rebuild + push when the wrapper changes).
+
+1. Export frames from an AppliedGS dataset (applied3 side, local/CPU) and upload to OCI:
+   ```bash
+   bazel run //third_party/applied_gs/tools/appliedgs/experimental/intrinsics:export_segment_frames -- \
+     --dataset-dir /applied2/tmp/pandaset_139 \
+     --cameras front_camera,left_camera,back_camera \
+     --out /applied2/tmp/dr_segments/pandaset_139
+   aws s3 sync /applied2/tmp/dr_segments/pandaset_139 \
+     s3://sensor-sim-wfm/inputs/dr_segments/pandaset_139/ \
+     --profile oci.phx --endpoint-url $EP
+   ```
+2. Launch the segment workload (config sets `mode: segment`, input/output prefixes,
+   `resize`, `chunk_mode`):
+   ```bash
+   lilypad workload launch \
+     adp/services/wfm/lilypad_workload_configs/cosmos_diffusion_renderer_segment_inference.yaml \
+     --name caleb-dr-segment-$(date +%s)
+   ```
+3. Download + scroll the mosaics:
+   ```bash
+   aws s3 sync s3://sensor-sim-wfm/inferences/dr_segments/pandaset_139/ \
+     ~/dr_out/pandaset_139/ --profile oci.phx --endpoint-url $EP
+   eog ~/dr_out/pandaset_139/front_camera/mosaic/
+   ```
+
+Local sm_120 dry-run of the wrapper exits **nonzero at the denoise step** (upstream
+prints "no kernel image available for sm_120") — that's the expected local wall; it
+confirms arg plumbing + output curation up to the GPU op. Run on A100 for real albedo.
